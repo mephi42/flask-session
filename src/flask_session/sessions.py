@@ -1,3 +1,4 @@
+from copy import deepcopy
 import sys
 import time
 from datetime import datetime
@@ -37,6 +38,7 @@ class ServerSideSession(CallbackDict, SessionMixin):
         if permanent:
             self.permanent = permanent
         self.modified = False
+        self.initial = {} if initial is None else deepcopy(initial)
 
 
 class RedisSession(ServerSideSession):
@@ -524,19 +526,21 @@ class SqlAlchemySessionInterface(SessionInterface):
 
             id = self.db.Column(self.db.Integer, primary_key=True)
             session_id = self.db.Column(self.db.String(255), unique=True)
-            data = self.db.Column(self.db.LargeBinary)
             expiry = self.db.Column(self.db.DateTime)
 
-            def __init__(self, session_id, data, expiry):
-                self.session_id = session_id
-                self.data = data
-                self.expiry = expiry
+        class SessionData(self.db.Model):
+            __tablename__ = table + "_data"
 
-            def __repr__(self):
-                return "<Session data %s>" % self.data
+            id = self.db.Column(self.db.Integer,
+                                self.db.ForeignKey(table + ".id",
+                                                   ondelete='cascade'),
+                                primary_key=True)
+            key = self.db.Column(self.db.String(255), primary_key=True)
+            value = self.db.Column(self.db.LargeBinary)
 
         # self.db.create_all()
         self.sql_session_model = Session
+        self.sql_session_data_model = SessionData
 
     def open_session(self, app, request):
         sid = request.cookies.get(app.config["SESSION_COOKIE_NAME"])
@@ -554,15 +558,20 @@ class SqlAlchemySessionInterface(SessionInterface):
         saved_session = self.sql_session_model.query.filter_by(
             session_id=store_id
         ).first()
-        if saved_session and saved_session.expiry <= datetime.utcnow():
+        if saved_session and \
+                saved_session.expiry and \
+                saved_session.expiry <= datetime.utcnow():
             # Delete expired session
             self.db.session.delete(saved_session)
             self.db.session.commit()
             saved_session = None
         if saved_session:
             try:
-                val = saved_session.data
-                data = self.serializer.loads(want_bytes(val))
+                data = {
+                    row.key: self.serializer.loads(want_bytes(row.value))
+                    for row in self.sql_session_data_model.query.filter_by(
+                        id=saved_session.id)
+                }
                 return self.session_class(data, sid=sid)
             except:
                 return self.session_class(sid=sid, permanent=self.permanent)
@@ -591,15 +600,25 @@ class SqlAlchemySessionInterface(SessionInterface):
         if self.has_same_site_capability:
             conditional_cookie_kwargs["samesite"] = self.get_cookie_samesite(app)
         expires = self.get_expiration_time(app, session)
-        val = self.serializer.dumps(dict(session))
         if saved_session:
-            saved_session.data = val
             saved_session.expiry = expires
-            self.db.session.commit()
         else:
-            new_session = self.sql_session_model(store_id, val, expires)
-            self.db.session.add(new_session)
-            self.db.session.commit()
+            saved_session = self.sql_session_model(session_id=store_id,
+                                                   expiry=expires)
+            self.db.session.add(saved_session)
+            self.db.session.flush()
+        self.db.session.query(self.sql_session_data_model).filter(
+            self.sql_session_data_model.id == saved_session.id,
+            self.sql_session_data_model.key.in_(
+                session.initial.keys() - session.keys())).delete()
+        for key, value in session.items():
+            if session.initial.get(key) == value:
+                continue
+            self.db.session.merge(
+                self.sql_session_data_model(id=saved_session.id,
+                                            key=key,
+                                            value=self.serializer.dumps(value)))
+        self.db.session.commit()
         if self.use_signer:
             session_id = self._sign(app, session.sid)
         else:
